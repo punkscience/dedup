@@ -1,154 +1,160 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"os"
-	"path/filepath"
+	"runtime"
+
+	"dedup/internal/action"
+	"dedup/internal/dupes"
+	"dedup/internal/keep"
+	"dedup/internal/scan"
 )
 
-// fileInfo stores the path and hash of a file.
-// We don't strictly need this struct anymore as we store path directly in map,
-// but keeping it doesn't hurt if we wanted to expand later.
-type fileInfo struct {
-	path string
-	hash string
+type config struct {
+	dir     string
+	act     action.Action
+	verb    string
+	dryRun  bool
+	keeper  keep.Selector
+	workers int
+	minSize int64
 }
 
-// Constants for byte conversion
-const (
-	bytesPerMegabyte = 1024.0 * 1024.0
-)
+var pastTense = map[string]string{"delete": "deleted", "hardlink": "hardlinked", "reflink": "reflinked"}
+
+type summary struct {
+	groups, dups, failed int
+	bytes                int64
+}
 
 func main() {
-	// 1. Define and parse command-line flags
-	dirPath := flag.String("dir", ".", "Directory to scan for duplicate files")
-	dryRun := flag.Bool("dryrun", false, "Enable dry run mode (report actions without deleting)")
-	flag.Parse()
-
-	// Validate the directory path
-	info, err := os.Stat(*dirPath)
+	log.SetFlags(0)
+	cfg, err := parseFlags()
 	if err != nil {
-		if os.IsNotExist(err) {
-			log.Fatalf("Error: Directory '%s' does not exist.", *dirPath)
-		}
-		log.Fatalf("Error accessing directory '%s': %v", *dirPath, err)
+		log.Fatal(err)
 	}
-	if !info.IsDir() {
-		log.Fatalf("Error: '%s' is not a directory.", *dirPath)
-	}
-
-	if *dryRun {
-		fmt.Println("--- DRY RUN MODE ENABLED: No files will be deleted. ---")
-	}
-	fmt.Printf("Scanning directory: %s\n", *dirPath)
-
-	// 2. Data structure to store hashes and the path of the *first* file seen
-	filesSeen := make(map[string]string)
-	var deletedCount int = 0
-	var totalBytesSaved int64 = 0 // Use int64 for potentially large sizes
-
-	// 3. Walk the directory recursively
-	err = filepath.WalkDir(*dirPath, func(path string, d fs.DirEntry, err error) error {
-		// Handle errors during walking (e.g., permission issues)
-		if err != nil {
-			log.Printf("Warning: Error accessing path %q: %v\n", path, err)
-			return err
-		}
-
-		// Skip directories
-		if d.IsDir() {
-			return nil
-		}
-
-		// Skip non-regular files
-		if !d.Type().IsRegular() {
-			return nil
-		}
-
-		// Calculate the file's hash
-		hashString, err := calculateFileHash(path)
-		if err != nil {
-			log.Printf("Warning: Could not calculate hash for file %q: %v. Skipping.\n", path, err)
-			return nil
-		}
-
-		// Check if this hash has been seen before
-		if originalPath, found := filesSeen[hashString]; found {
-			// Duplicate found!
-
-			// Get file info to find its size
-			fInfo, err := d.Info()
-			if err != nil {
-				// This is less likely if WalkDir succeeded, but check anyway
-				log.Printf("Warning: Could not get file info for %q: %v. Skipping deletion/reporting size.\n", path, err)
-				return nil // Skip processing this specific duplicate
-			}
-			fileSize := fInfo.Size()
-
-			if *dryRun {
-				// Dry Run Mode: Report only
-				fmt.Printf("[Dry Run] Would delete: '%s' (duplicate of '%s', size: %d bytes)\n", path, originalPath, fileSize)
-				deletedCount++
-				totalBytesSaved += fileSize
-			} else {
-				// Actual Deletion Mode
-				fmt.Printf("Duplicate found: '%s' is same as '%s'. Deleting '%s' (size: %d bytes).\n", path, originalPath, path, fileSize)
-				err := os.Remove(path)
-				if err != nil {
-					log.Printf("Error: Failed to delete file '%s': %v\n", path, err)
-					// Don't count bytes if deletion failed
-				} else {
-					deletedCount++              // Increment count only if deletion succeeded
-					totalBytesSaved += fileSize // Add size only if deletion succeeded
-				}
-			}
-		} else {
-			// First time seeing this hash, record it
-			filesSeen[hashString] = path
-		}
-
-		return nil // Continue walking
-	})
-
-	// Check for errors encountered during the walk itself
-	if err != nil {
-		log.Fatalf("Error walking the path %q: %v\n", *dirPath, err)
-	}
-
-	// 4. Report results
-	fmt.Println("\n--- Scan Complete ---")
-	megabytesSaved := float64(totalBytesSaved) / bytesPerMegabyte
-
-	if *dryRun {
-		fmt.Printf("Total files identified for deletion: %d\n", deletedCount)
-		fmt.Printf("Total disk space that would be saved: %.2f MB\n", megabytesSaved)
-	} else {
-		fmt.Printf("Total files actually deleted: %d\n", deletedCount)
-		fmt.Printf("Total disk space saved: %.2f MB\n", megabytesSaved)
+	if err := run(cfg, os.Stdout); err != nil {
+		log.Fatal(err)
 	}
 }
 
-// calculateFileHash opens a file, calculates its SHA256 hash, and returns the hex string.
-func calculateFileHash(filePath string) (string, error) {
-	file, err := os.Open(filePath)
+func parseFlags() (config, error) {
+	var cfg config
+	var prefer []string
+	actName := flag.String("action", "report", "report, delete, hardlink or reflink")
+	keepRule := flag.String("keep", "oldest", "copy to keep: oldest, newest, shortest or first")
+	flag.StringVar(&cfg.dir, "dir", ".", "directory to scan")
+	flag.BoolVar(&cfg.dryRun, "dryrun", false, "show what -action would do without doing it")
+	flag.IntVar(&cfg.workers, "workers", runtime.NumCPU(), "parallel readers (use 1-2 on spinning disks)")
+	flag.Int64Var(&cfg.minSize, "min-size", 1, "ignore files smaller than this many bytes")
+	flag.Func("prefer", "keep copies under this directory first (repeatable)", func(s string) error {
+		prefer = append(prefer, s)
+		return nil
+	})
+	flag.Parse()
+
+	act, err := action.Parse(*actName)
 	if err != nil {
-		return "", fmt.Errorf("failed to open file: %w", err)
+		return cfg, err
 	}
-	defer file.Close() // Ensure file is closed
+	rule, err := keep.ParseRule(*keepRule)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.act, cfg.verb, cfg.keeper = act, *actName, keep.Selector{Rule: rule, Prefer: prefer}
 
-	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
-		return "", fmt.Errorf("failed to read file for hashing: %w", err)
+	info, err := os.Stat(cfg.dir)
+	if err != nil {
+		return cfg, err
+	}
+	if !info.IsDir() {
+		return cfg, fmt.Errorf("%s is not a directory", cfg.dir)
+	}
+	return cfg, nil
+}
+
+func run(cfg config, out io.Writer) error {
+	warn := func(err error) { log.Printf("warning: %v", err) }
+
+	files, err := scan.Walk(cfg.dir, cfg.minSize, warn)
+	if err != nil {
+		return err
+	}
+	groups := dupes.Find(files, dupes.Options{Workers: cfg.workers, Warn: warn})
+	if cfg.act != nil && cfg.act.SameDevice() {
+		groups = dupes.SplitByDevice(groups)
 	}
 
-	hashBytes := hasher.Sum(nil)
-	hashString := hex.EncodeToString(hashBytes)
+	var s summary
+	for _, g := range groups {
+		s.groups++
+		keeper, dups := cfg.keeper.Split(g)
+		fmt.Fprintf(out, "\n%d copies, %s each\n  keep  %s\n", len(g), human(keeper.Size), keeper.Path)
+		for _, dup := range dups {
+			s.apply(cfg, keeper, dup, out)
+		}
+	}
+	s.print(cfg, len(files), out)
+	return nil
+}
 
-	return hashString, nil
+func (s *summary) apply(cfg config, keeper, dup dupes.File, out io.Writer) {
+	if cfg.act == nil || cfg.dryRun {
+		fmt.Fprintf(out, "  dup   %s\n", dup.Path)
+		s.dups++
+		s.bytes += reclaimable(cfg.act, dup)
+		return
+	}
+	err := errors.Join(action.Verify(keeper), action.Verify(dup))
+	if err == nil {
+		err = cfg.act.Apply(keeper, dup)
+	}
+	if err != nil {
+		fmt.Fprintf(out, "  FAIL  %s: %v\n", dup.Path, err)
+		s.failed++
+		return
+	}
+	fmt.Fprintf(out, "  dup   %s (%s)\n", dup.Path, pastTense[cfg.verb])
+	s.dups++
+	s.bytes += cfg.act.Reclaims(dup)
+}
+
+func (s summary) print(cfg config, scanned int, out io.Writer) {
+	verb := "reclaimable"
+	switch {
+	case cfg.act != nil && cfg.dryRun:
+		verb = "would be reclaimed by " + cfg.verb
+	case cfg.act != nil:
+		verb = "reclaimed by " + cfg.verb
+	}
+	fmt.Fprintf(out, "\nScanned %d files: %d duplicate groups, %d duplicates, %s %s\n",
+		scanned, s.groups, s.dups, human(s.bytes), verb)
+	if s.failed > 0 {
+		fmt.Fprintf(out, "%d duplicates failed\n", s.failed)
+	}
+}
+
+func reclaimable(act action.Action, dup dupes.File) int64 {
+	if act == nil {
+		return action.Delete{}.Reclaims(dup)
+	}
+	return act.Reclaims(dup)
+}
+
+func human(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

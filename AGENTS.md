@@ -4,52 +4,71 @@ Project-specific context for AI coding agents operating in this repository.
 
 ## Project overview
 
-`dedup` is a single-file Go CLI that recursively scans a directory, hashes every regular file with SHA-256, and deletes duplicates — keeping the first file encountered for each hash. A dry-run mode reports what would be deleted and the space saved.
+`dedup` is a portable Go CLI that finds files with identical content under a directory and, optionally, reclaims the space by deleting, hardlinking or reflinking the duplicates. It reads as little as possible and keeps no on-disk index.
 
 ## Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Language | Go (`go 1.21.6` in `go.mod`) |
-| Package manager | Go modules (stdlib only, no `go.sum`) |
-| Testing | None yet |
+| Language | Go (`go 1.26.0` in `go.mod`) |
+| Dependencies | `golang.org/x/sys` (reflink and Windows file identity) |
+| Testing | `go test` |
 | Build | `go build` |
 
 ## Commands
 
 - **Build:** `go build -o dedup .`
-- **Run:** `go run . -dir <path> [-dryrun]`
-- **Test:** `go test ./...` (no tests exist yet)
+- **Test:** `go test -race ./...`
+- **Reflink test:** `DEDUP_REFLINK_DIR=<dir on btrfs/xfs/apfs/refs> go test ./internal/action`
+- **Cross-check platforms:** `GOOS=windows go vet ./...`, `GOOS=darwin go vet ./...`
 - **Format:** `gofmt -w .`
-- **Vet:** `go vet ./...`
+
+If `/tmp` (tmpfs) fills during builds, set `GOTMPDIR` and `TMPDIR` to a directory on disk.
 
 ## Usage
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `-dir` | `.` | Directory to scan recursively |
-| `-dryrun` | `false` | Report deletions without removing files |
+| `-dir` | `.` | Directory to scan |
+| `-action` | `report` | `report`, `delete`, `hardlink` or `reflink` |
+| `-dryrun` | `false` | Show what `-action` would do |
+| `-keep` | `oldest` | Copy to keep: `oldest`, `newest`, `shortest`, `first` (path order) |
+| `-prefer` | — | Keep copies under this directory first; repeatable |
+| `-workers` | CPU count | Parallel readers; use 1–2 on spinning disks |
+| `-min-size` | `1` | Ignore smaller files (empty files skipped by default) |
+
+## Pipeline
+
+1. `scan` walks the tree (unreadable paths warn and skip).
+2. `dupes` groups by size, collapses hardlinks by device+inode, hashes the first and last 16 KiB, then fully hashes (SHA-256) only the survivors. Files ≤ 32 KiB are fully hashed in the first pass.
+3. `keep` picks the surviving copy.
+4. `action` re-stats both files (size, mtime, identity) before acting.
 
 ## Project structure
 
-- `main.go` — entire program: flag parsing, `filepath.WalkDir` traversal, `calculateFileHash`, summary report
-- `go.mod` — module `dedup`
+- `main.go` — flags, wiring, output
+- `internal/scan` — directory walk
+- `internal/fileid` — device/inode/link-count per OS (`unix`, `windows`, fallback)
+- `internal/dupes` — narrowing pipeline and parallel hashing
+- `internal/keep` — keeper selection
+- `internal/action` — delete / hardlink / reflink and pre-action verification
+- `internal/clone` — reflink per OS: Linux `FIDEDUPERANGE` (in place, kernel-verified), macOS `clonefile`, Windows ReFS `FSCTL_DUPLICATE_EXTENTS_TO_FILE`
+- `internal/fsutil` — atomic replace via temp file + rename
+- `internal/testutil` — test helpers
 
 ## Conventions
 
-- **Code style:** standard `gofmt`.
-- **Module layout:** flat, single `main` package.
-- **Coding standard:** Punk Science coding standard; SOLID.
+- Punk Science coding standard; SOLID. New actions implement `action.Action`; new platforms add a build-tagged file.
+- Standard `gofmt`.
 
 ## Behaviour notes
 
-- **Destructive by default.** Without `-dryrun`, duplicates are deleted immediately via `os.Remove`. Always use `-dryrun` or a throwaway directory when testing.
-- **Which copy survives** depends on `WalkDir` lexical order — the first path seen for a hash is kept; later ones are deleted.
-- The `WalkDir` callback returns the error on access failures, which aborts the whole walk despite logging it as a "Warning".
-- `fileInfo` struct is unused.
-- Symlinks and other non-regular files are skipped.
+- Default action is `report`; nothing is modified unless `-action` is given.
+- Hardlink and reflink split groups by device so the keeper is always on the same volume.
+- Hardlinking replaces the duplicate's inode, so its own permissions and mtime are lost. Reflink keeps them.
+- Reclaimed bytes count 0 for a name whose inode has other links.
+- macOS and Windows reflink paths compile but have not been run on real hardware.
 
 ## Notes
 
 - Remote: `https://github.com/punkscience/dedup`
-- `.gitignore` excludes the built `dedup` binary, test output, and editor files.
