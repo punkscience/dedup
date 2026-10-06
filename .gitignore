@@ -1,0 +1,25 @@
+# Binaries
+/dedup
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test output
+*.test
+*.out
+coverage.*
+*.coverprofile
+
+# Go workspace
+go.work
+go.work.sum
+
+# Environment
+.env
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

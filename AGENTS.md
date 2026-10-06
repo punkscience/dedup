@@ -52,4 +52,4 @@ Project-specific context for AI coding agents operating in this repository.
 ## Notes
 
 - Remote: `https://github.com/punkscience/dedup`
-- No `.gitignore`; a built `dedup` binary in the root would be untracked.
+- `.gitignore` excludes the built `dedup` binary, test output, and editor files.
